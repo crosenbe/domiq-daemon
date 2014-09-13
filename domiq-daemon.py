@@ -1,160 +1,153 @@
 #!/usr/bin/python
 
-import sys, socket, time, threading, select, getopt
+from twisted.internet.protocol import Protocol, ReconnectingClientFactory, Factory
+from twisted.protocols.basic import LineReceiver
+from twisted.internet.defer import Deferred
+from twisted.internet import reactor
+from twisted.internet.task import LoopingCall
+from sys import stdout, argv, exit
+from getopt import getopt, GetoptError
+from time import time, sleep
 
-buffer_size = 1024
-delay = 0.0001
-
-class MySocket():
-
+class Controller:
     def __init__(self):
-        self.__sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.__sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.__controller = {}
+        self.client_protocol = None
 
-    def connect(self):
-        while True:
-            try:
-                self.__sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.__sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.__sock.connect((domiq_host, domiq_port))
-                break
-            except Exception, e:
-                print 'Error on connect:', e
-		time.sleep(5)
-                continue
+    def add_entry(self, key, value):
+        if self.__controller.has_key(key):
+            print 'Refreshed ',key,':',value
+        else:
+            print 'Added ',key,':',value
+        self.__controller[key] = [value, time()]
 
-    def disconnect(self):
-        try:
-            self.__sock.close()
-        except Exception, e:
-            print 'Error on disconnect:', e
+    def remove_entry(self, key):
+        if self.__controller.has_key(key):
+            del self.__controller[key]
 
-    def sendall(self,content):
-        while True:
-            try:
-                self.__sock.sendall(content)
-                break
-            except socket.error:
-                self.disconnect()
-                self.connect()
+    def get_entry(self, key):
+        if self.__controller.has_key(key):
+            return self.__controller[key][0]
+        else:
+            return None
 
-    def recv(self,buffersize):
-        while True:
-            try:
-                return self.__sock.recv(buffersize)
-            except socket.error:
-                self.disconnect()
-                self.connect()
+    def garbage(self):
+        """ remove all entries which are older as cachetime """
+        print 'Starting garbage collector.'
+        for key in self.__controller.keys():
+            if time() - self.__controller[key][1] > cachetime:
+                del self.__controller[key]
+                print 'Removed ', key, ', caching period time expired'
 
+    def show_all(self):
+        return self.__controller
 
-class Uplink(threading.Thread):
+class CachingServer(LineReceiver):
+    def __init__(self, controller):
+        self.delimiter = '\n'
+        self.__controller = controller
 
-    def __init__(self):
-        threading.Thread.__init__(self)
-        self.uplink = MySocket()
-        self.__stop = False
-        self.__data = ''
-        self.__cache = {}
+    def connectionMade(self):
+        pass
 
-    def stop(self):
-        self.__stop = True
+    def connectionLost(self, reason):
+        pass
 
-    def run(self):
-        try:
-            self.uplink.sendall('?\n')
-        except Exception, e:
-            print e
+    def lineReceived(self, line):
+        self.handle_chat(line)
 
-        while self.__stop == False:
-            time.sleep(delay)
-            self.__data += self.uplink.recv(buffer_size)
-            if len(self.__data) == 0:
-                break
-            else:
-                self.on_recv()
+    def handle_chat(self, message):
+        """ handle requests from clients """
+        # syntax check
+        if message == "?":
+            for key in self.__controller.show_all().keys():
+                self.sendLine('%s=%s' % (key, self.__controller.get_entry(key)))
+            return
 
-    def send_request(self,key):
-        if not self.__cache.has_key(key):
-            print 'no key send request to socket', key
-            try:
-                self.uplink.sendall('%s=?\n' % (key))
-            except Exception, e:
-                print e
-                print self.uplink
-        elif time.time() - self.__cache[key][1] > cachetime:
-            print 'old cache send request to socket', key
-            try:
-                self.uplink.sendall('%s=?\n' % (key))
-            except Exception, e:
-                print e
-                print self.uplink
+        if len(message.rsplit('=')) > 1:
+            key = message.rsplit('=')[0]
+            value = self.__controller.get_entry(key)
+            if value is not None:
+                self.buildResponse(key, value)
+                return
 
-    def cache_entry(self,key,value):
-        self.__cache[key] = [value,time.time()]
+            if self.__controller.client_protocol is not None:
+                response = self.__controller.client_protocol.requestKey(key)
+                response.addCallback(self.gotResponse)
 
-    def get_entry(self,key):
-        # get one entry from cache an delivers the value back
-        self.send_request(key)
-        time.sleep(0.1)
-        return self.__cache.get(key,['NONE',0])[0]
+    def buildResponse(self, key, value=None):
+        if value is None:
+            retval = '%s=not available' % (key)
+        else:
+            retval = '%s=%s' % (key, value)
+        self.sendLine(retval)
+        print 'send to client: ', retval
 
-    def on_recv(self):
-        # split the input to key and value
-        for element in self.__data.splitlines(True):
-            if element.find('\r\n') > 0:     # if the line is complete
-                data = element.rstrip('\r\n')
-                key, value = data.split('=')
-                self.cache_entry(key,value)
-            else:  # store incomplete commands
-                self.__data = element
+    def gotResponse(self, result):
+        self.buildResponse(result[0], result[1])
 
-class Server:
+class CachingServerFactory(Factory):
+    def __init__(self, controller):
+        self.__controller = controller
 
-    input_list = []
+    def buildProtocol(self, addr):
+        return CachingServer(controller)
 
-    def __init__(self, host, port):
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind((host, port))
-        self.server.listen(200)
+class DomiqUplink(LineReceiver):
+    def __init__(self, controller):
+        self.__controller = controller
+        self.__lc = LoopingCall(self.garbage)
+        self.__lc.start(cachetime, False)
+        self.__requestResult = {}
 
-    def main_loop(self, uplink):
-        self.uplink = uplink
-        self.input_list.append(self.server)
-        while 1:
-            time.sleep(delay)
-            ss = select.select
-            inputready, outputready, exceptready = ss(self.input_list, [], [])
-            for self.s in inputready:
-                if self.s == self.server:
-                    self.on_accept()
-                    break
+    def connectionMade(self):
+        self.__controller.client_protocol = self
+        #self.requestAll()
 
-                self.data = self.s.recv(buffer_size)
-                if len(self.data) == 0:
-                    pass
-                    self.on_close()
-                else:
-                    self.on_recv()
+    def requestKey(self, key):
+        d = Deferred()
+        self.__requestResult[key] = d
+        self.sendLine('%s=?' % (key))
+        return d
 
-    def on_close(self):
-        self.input_list.remove(self.s)
-        self.s.close()
+    def requestAll(self):
+        self.sendLine("?")
 
-    def on_accept(self):
-        clientsock, clientaddr = self.server.accept()
-        self.input_list.append(clientsock)
+    def lineReceived(self, data):
+        """ fill central database with values """
+        key, value = data.split('=')
+        self.__controller.add_entry(key,value)
+        if key in self.__requestResult.keys():
+            self.__requestResult[key].callback([key, value])
+            del self.__requestResult[key]
 
-    def on_recv(self):
-        if self.data.find('\n') > 0:    # command is complete
-            line = self.data.splitlines()[0]
-            if len(line.rsplit('=')) > 1:
-                key = line.rsplit('=')[0]
-                value = self.uplink.get_entry(key)
-                self.s.sendall('%s=%s\n' % ( key, value ))
-            else:
-                self.s.sendall('not available\n')
-            self.on_close()
+    def garbage(self):
+        #self.requestAll()
+        #for key in self.__controller.show_all().keys():
+        #    self.requestKey(key)
+        self.__controller.garbage()
+
+class DomiqClientFactory(ReconnectingClientFactory):
+    def __init__(self, controller, caching_server):
+        self.__controller = controller
+        self.caching_server = caching_server
+
+    def startedConnecting(self, connector):
+        print 'Started to connect.'
+
+    def buildProtocol(self, addr):
+        print 'Connected.'
+        print 'Resetting reconnection delay.'
+        self.resetDelay()
+        return DomiqUplink(self.__controller)
+
+    def clientConnectionLost(self, connector, reason):
+        print 'Lost connection. Reason: ', reason
+        ReconnectingClientFactory.clientConnectionLost(self, connector, reason)
+
+    def clientConnectionFailed(self, connector, reason):
+        print 'Connection failed. Reason: ', reason
+        ReconnectingClientFactory.clientConnectionFailed(self, connector, reason)
 
 def usage():
     print 'Usage: domiq-proxy -d DOMIQHOST [OPTION]'
@@ -166,8 +159,8 @@ def usage():
     print '-c, --cachetime          how long the retrieved values should hold in cache before'
     print '                         forcing a refresh, default=900, specifiy in seconds'
     print '-h, --help               display this help and exit'
-    print '' 
-    sys.exit(1)
+    print ''
+    exit(1)
 
 def param(argv):
 
@@ -177,8 +170,8 @@ def param(argv):
     global cachetime
 
     try:
-        opts, args = getopt.getopt(argv,"d:p:l:c:h",["domiq-host=","domiq-port=","listen-port=","cachetime=","help"])
-    except getopt.GetoptError:
+        opts, args = getopt(argv,"d:p:l:c:h",["domiq-host=","domiq-port=","listen-port=","cachetime=","help"])
+    except GetoptError:
         usage()
     for opt,arg in opts:
         if opt in ("-h", "--help"):
@@ -194,6 +187,7 @@ def param(argv):
 
     if domiq_host == '': usage()
 
+
 if __name__ == '__main__':
 
     listen_port = 4224
@@ -201,22 +195,13 @@ if __name__ == '__main__':
     domiq_port = 4224
     cachetime = 900
     # parse parameters
-    param(sys.argv[1:])
+    param(argv[1:])
 
-    # start uplink to Domiq Base
-    uplink = Uplink()
-    uplink.daemon = True
-    uplink.setDaemon(True)
-    uplink.start()
+    # define global caching database
+    controller = Controller()
 
-    # start listening server
-    server = Server('', listen_port)
-    try:
-        server.main_loop(uplink)
-    except KeyboardInterrupt:
-        print "Ctrl C - Stopping server"
-        uplink.stop()
-        uplink.join()
-        sys.exit(1)
-
+    caching_server = CachingServerFactory(controller)
+    reactor.listenTCP(listen_port, caching_server)
+    reactor.connectTCP(domiq_host,domiq_port, DomiqClientFactory(controller, caching_server))
+    reactor.run()
 
