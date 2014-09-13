@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
 #  Domiq Base Caching Daemon        by Claus Rosenberger
+#  Licensed: GPLv2
 #
 #  This daemon connects to Domiq Base and store all visible variables in a
 #  cache dict. The daemon does listen itself for client requests and delivers
