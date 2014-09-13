@@ -1,5 +1,16 @@
 #!/usr/bin/python
 
+#  Domiq Base Caching Daemon        by Claus Rosenberger
+#
+#  This daemon connects to Domiq Base and store all visible variables in a
+#  cache dict. The daemon does listen itself for client requests and delivers
+#  the variables from the cache dict, if the variable does not exist it try 
+#  to fetch it from the Base.
+#
+#  1.0  - First release
+#  1.1  - Complete rewrite with the twisted framework
+#
+
 from twisted.internet.protocol import Protocol, ReconnectingClientFactory, Factory
 from twisted.protocols.basic import LineReceiver
 from twisted.internet.defer import Deferred
