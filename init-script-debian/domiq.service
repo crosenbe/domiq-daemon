@@ -1,0 +1,15 @@
+[Unit]
+Description=DOMIQ Proxy Service
+After=network.target
+
+[Service]
+EnvironmentFile=-/etc/default/domiq
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python /usr/local/sbin/domiq-base -d $DOMIC_BASE_HOST -c $CACHETIME
+Restart=on-failure
+User=domiq
+Group=domiq
+
+[Install]
+WantedBy=multi-user.target
+
